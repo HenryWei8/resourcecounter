@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Colonist Turn Logger (Live Append Prototype)",
+  "version": "0.3.0",
+  "description": "Logs Colonist feed into per-turn records and appends them to a Google Sheet via Apps Script.",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "https://colonist.io/*",
+    "https://*.colonist.io/*",
+    "https://script.google.com/*",
+    "https://script.googleusercontent.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://colonist.io/*", "https://*.colonist.io/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

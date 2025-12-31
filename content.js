@@ -1,0 +1,722 @@
+(() => {
+  if (window.__colonistTurnLoggerLoaded) return;
+  window.__colonistTurnLoggerLoaded = true;
+
+  const DEBUG = true;
+  const LOG_ROOT_SELECTOR = "[class*='gameFeedsContainer']";
+  const TICK_MS = 900;
+  const LOG_MISSING_NEW_GAME_MS = 3500;
+
+  const OVERLAY_ENABLED = true;
+  const OVERLAY_MAX_ROWS = 40;
+  const OVERLAY_WIDTH_PX = 360;
+
+  const RES_KEYS = ["lumber", "brick", "wool", "grain", "ore"];
+  const RES_WORD_TO_KEY = {
+    lumber: "lumber",
+    wood: "lumber",
+    brick: "brick",
+    clay: "brick",
+    wool: "wool",
+    sheep: "wool",
+    grain: "grain",
+    wheat: "grain",
+    ore: "ore",
+    rock: "ore",
+    stone: "ore",
+  };
+
+  const BUILD_COST = {
+    road: { lumber: 1, brick: 1 },
+    settlement: { lumber: 1, brick: 1, wool: 1, grain: 1 },
+    city: { grain: 2, ore: 3 },
+    dev: { wool: 1, grain: 1, ore: 1 },
+  };
+
+  function log(...args) {
+    if (DEBUG) console.log("[CTL]", ...args);
+  }
+  function warn(...args) {
+    console.warn("[CTL]", ...args);
+  }
+
+  function emptyBag() {
+    const b = {};
+    RES_KEYS.forEach((r) => (b[r] = 0));
+    return b;
+  }
+  function addBag(dst, src, s = 1) {
+    RES_KEYS.forEach((r) => (dst[r] += s * (src[r] || 0)));
+  }
+
+  function keyFromImg(img) {
+    if (!img) return null;
+    const alt = (img.alt || "").toLowerCase().trim();
+    if (RES_WORD_TO_KEY[alt]) return RES_WORD_TO_KEY[alt];
+    const src = (img.src || "").toLowerCase();
+    for (const word of Object.keys(RES_WORD_TO_KEY)) {
+      if (src.includes(word)) return RES_WORD_TO_KEY[word];
+    }
+    return null;
+  }
+
+  function bagFromAllImages(node) {
+    const bag = emptyBag();
+    const imgs = node ? [...node.querySelectorAll("img")] : [];
+    for (const im of imgs) {
+      const k = keyFromImg(im);
+      if (k) bag[k] += 1;
+    }
+    return bag;
+  }
+
+  function splitImagesGiveGet(node, giveText, midText, endText) {
+    const give = emptyBag();
+    const get = emptyBag();
+    let mode = "before";
+
+    const w = document.createTreeWalker(
+      node,
+      NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT
+    );
+
+    while (w.nextNode()) {
+      const n = w.currentNode;
+
+      if (n.nodeType === 3) {
+        const t = (n.textContent || "").toLowerCase();
+        if (t.includes(giveText.toLowerCase())) mode = "give";
+        if (t.includes(midText.toLowerCase())) mode = "get";
+        if (endText && t.includes(endText.toLowerCase())) mode = "after";
+      } else if (n.nodeType === 1 && n.tagName === "IMG") {
+        const k = keyFromImg(n);
+        if (!k) continue;
+        if (mode === "give") give[k] += 1;
+        else if (mode === "get") get[k] += 1;
+      }
+    }
+    return { giveBag: give, getBag: get };
+  }
+
+  function extractNamesFromMessage(msgEl) {
+    const nameSpans = [
+      ...msgEl.querySelectorAll('span[style*="font-weight:600"]'),
+    ];
+    const names = nameSpans
+      .map((s) => (s.textContent || "").trim())
+      .filter(Boolean);
+
+    let actor = names[0] || null;
+    let partner = names.length >= 2 ? names[names.length - 1] : null;
+
+    if (!actor) {
+      const raw = (msgEl.innerText || msgEl.textContent || "")
+        .trim()
+        .replace(/\s+/g, " ");
+      const m = raw.match(/^(\S+)/);
+      actor = m ? m[1] : null;
+      const pm = raw.match(/ from (\S+)/i);
+      partner = pm ? pm[1].replace(/[.!?]$/, "") : null;
+    }
+    return { actor, partner };
+  }
+
+  function isTurnDelimiter(itemNode) {
+    const msg =
+      itemNode.querySelector("span[class*='messagePart']") || itemNode;
+    return !!msg.querySelector("hr");
+  }
+
+  function getVpForPlayerName(name) {
+    if (!name) return "";
+    const rows = document.querySelectorAll('div[class*="playerRow"]');
+    for (const row of rows) {
+      const nameEl =
+        row.querySelector('div[class*="username"]') ||
+        row.querySelector('div[class*="usernameLarge"]');
+      if (!nameEl) continue;
+
+      const rowName = (nameEl.textContent || "").trim();
+      if (rowName !== name) continue;
+
+      const vpEl = row.querySelector('span[class*="victoryPoints"]');
+      if (!vpEl) return "";
+
+      const vp = parseInt((vpEl.textContent || "").trim(), 10);
+      return Number.isFinite(vp) ? vp : "";
+    }
+    return "";
+  }
+
+  function allocGameId() {
+    try {
+      const a = new Uint32Array(2);
+      crypto.getRandomValues(a);
+      const big =
+        (BigInt(Date.now()) << 32n) ^ (BigInt(a[0]) << 16n) ^ BigInt(a[1]);
+      return Number((big % 900000000000000n) + 100000000000000n);
+    } catch {
+      return Math.floor(100000000000000 + Math.random() * 900000000000000);
+    }
+  }
+
+  let gameId = allocGameId();
+  let turnNumber = 1;
+
+  let lastPathKey = `${location.origin}${location.pathname}`;
+  let lastLogMissingAt = null;
+
+  function startNewGame(reason) {
+    gameId = allocGameId();
+    turnNumber = 1;
+    log("NEW GAME", { gameId, reason, url: location.href });
+    overlay?.setHeader?.();
+    overlay?.addLine?.(`NEW GAME (${reason})`, "sys");
+  }
+
+  function sendRow(row) {
+    if (!chrome?.runtime?.sendMessage) {
+      warn("chrome.runtime.sendMessage not available; cannot POST", row);
+      return;
+    }
+    chrome.runtime.sendMessage(
+      { type: "POST_TURN_EVENTS", record: row },
+      (resp) => {
+        const err = chrome.runtime.lastError;
+        if (err) warn("sendMessage error:", err.message || err);
+        else if (DEBUG) log("POST_TURN_EVENTS resp:", resp);
+      }
+    );
+  }
+
+  function formatResourceForOverlay(resource) {
+    if (!resource) return "";
+    if (typeof resource === "string") return resource;
+    try {
+      if (
+        resource &&
+        typeof resource === "object" &&
+        !Array.isArray(resource)
+      ) {
+        const parts = [];
+        for (const k of RES_KEYS) {
+          const v = resource[k];
+          if (!v) continue;
+          parts.push(v > 0 ? `+${k}${v}` : `-${k}${Math.abs(v)}`);
+        }
+        if (parts.length) return parts.join(" ");
+      }
+      return JSON.stringify(resource);
+    } catch {
+      return String(resource);
+    }
+  }
+
+  function createOverlay() {
+    if (!OVERLAY_ENABLED) return null;
+    const id = "__ctl_overlay";
+    const existing = document.getElementById(id);
+    if (existing) return existing;
+
+    const root = document.createElement("div");
+    root.id = id;
+    root.style.position = "fixed";
+    root.style.top = "12px";
+    root.style.right = "12px";
+    root.style.width = `${OVERLAY_WIDTH_PX}px`;
+    root.style.maxHeight = "70vh";
+    root.style.zIndex = "2147483647";
+    root.style.background = "rgba(15, 15, 18, 0.88)";
+    root.style.border = "1px solid rgba(255,255,255,0.15)";
+    root.style.borderRadius = "10px";
+    root.style.boxShadow = "0 12px 30px rgba(0,0,0,0.35)";
+    root.style.backdropFilter = "blur(6px)";
+    root.style.color = "rgba(255,255,255,0.95)";
+    root.style.fontFamily =
+      "ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial";
+    root.style.overflow = "hidden";
+
+    const header = document.createElement("div");
+    header.style.display = "flex";
+    header.style.alignItems = "center";
+    header.style.justifyContent = "space-between";
+    header.style.padding = "10px 12px";
+    header.style.borderBottom = "1px solid rgba(255,255,255,0.12)";
+
+    const title = document.createElement("div");
+    title.style.fontSize = "13px";
+    title.style.fontWeight = "700";
+    title.textContent = "Colonist Turn Logger";
+
+    const status = document.createElement("div");
+    status.style.fontSize = "12px";
+    status.style.opacity = "0.85";
+    status.textContent = "";
+
+    const controls = document.createElement("div");
+    controls.style.display = "flex";
+    controls.style.gap = "8px";
+
+    const btnClear = document.createElement("button");
+    btnClear.textContent = "Clear";
+    btnClear.style.cursor = "pointer";
+    btnClear.style.fontSize = "12px";
+    btnClear.style.padding = "6px 8px";
+    btnClear.style.borderRadius = "8px";
+    btnClear.style.border = "1px solid rgba(255,255,255,0.18)";
+    btnClear.style.background = "rgba(255,255,255,0.06)";
+    btnClear.style.color = "rgba(255,255,255,0.92)";
+
+    const btnMin = document.createElement("button");
+    btnMin.textContent = "Min";
+    btnMin.style.cursor = "pointer";
+    btnMin.style.fontSize = "12px";
+    btnMin.style.padding = "6px 8px";
+    btnMin.style.borderRadius = "8px";
+    btnMin.style.border = "1px solid rgba(255,255,255,0.18)";
+    btnMin.style.background = "rgba(255,255,255,0.06)";
+    btnMin.style.color = "rgba(255,255,255,0.92)";
+
+    controls.appendChild(btnClear);
+    controls.appendChild(btnMin);
+
+    const left = document.createElement("div");
+    left.style.display = "flex";
+    left.style.flexDirection = "column";
+    left.style.gap = "2px";
+    left.appendChild(title);
+    left.appendChild(status);
+
+    header.appendChild(left);
+    header.appendChild(controls);
+
+    const list = document.createElement("div");
+    list.style.padding = "8px 10px";
+    list.style.maxHeight = "calc(70vh - 52px)";
+    list.style.overflowY = "auto";
+    list.style.display = "flex";
+    list.style.flexDirection = "column";
+    list.style.gap = "6px";
+
+    root.appendChild(header);
+    root.appendChild(list);
+    document.documentElement.appendChild(root);
+
+    let minimized = false;
+    btnMin.onclick = () => {
+      minimized = !minimized;
+      list.style.display = minimized ? "none" : "flex";
+      btnMin.textContent = minimized ? "Show" : "Min";
+    };
+    btnClear.onclick = () => {
+      list.innerHTML = "";
+    };
+
+    function setHeader() {
+      status.textContent = `game ${gameId} | turn ${turnNumber} | idx ${lastLogIndex}`;
+    }
+
+    function addLineFromEvent(evt) {
+      const row = document.createElement("div");
+      row.style.padding = "8px 8px";
+      row.style.borderRadius = "8px";
+      row.style.border = "1px solid rgba(255,255,255,0.10)";
+      row.style.background = "rgba(255,255,255,0.04)";
+
+      const top = document.createElement("div");
+      top.style.display = "flex";
+      top.style.alignItems = "baseline";
+      top.style.justifyContent = "space-between";
+      top.style.gap = "10px";
+
+      const left = document.createElement("div");
+      left.style.fontSize = "12.5px";
+      left.style.fontWeight = "650";
+      const subj = evt.subject || "";
+      const vpText =
+        evt.vp === "" || evt.vp === null || evt.vp === undefined
+          ? ""
+          : ` (VP ${evt.vp})`;
+      const obj = evt.object ? ` → ${evt.object}` : "";
+      left.textContent = `T${evt.turn_number} ${subj}${vpText}${obj}`;
+
+      const act = document.createElement("div");
+      act.style.fontSize = "12px";
+      act.style.opacity = "0.9";
+      act.textContent = evt.action || "";
+
+      top.appendChild(left);
+      top.appendChild(act);
+
+      const res = document.createElement("div");
+      res.style.marginTop = "4px";
+      res.style.fontSize = "12px";
+      res.style.opacity = "0.9";
+      const rs = formatResourceForOverlay(evt.resource);
+      res.textContent = rs ? rs : "";
+
+      row.appendChild(top);
+      if (rs) row.appendChild(res);
+
+      list.prepend(row);
+      while (list.childElementCount > OVERLAY_MAX_ROWS) {
+        list.removeChild(list.lastElementChild);
+      }
+    }
+
+    function addLine(text, kind = "info") {
+      const row = document.createElement("div");
+      row.style.padding = "8px 8px";
+      row.style.borderRadius = "8px";
+      row.style.border = "1px solid rgba(255,255,255,0.10)";
+      row.style.background =
+        kind === "sys" ? "rgba(120, 180, 255, 0.10)" : "rgba(255,255,255,0.04)";
+      row.style.fontSize = "12px";
+      row.style.opacity = "0.92";
+      row.textContent = text;
+      list.prepend(row);
+      while (list.childElementCount > OVERLAY_MAX_ROWS) {
+        list.removeChild(list.lastElementChild);
+      }
+    }
+
+    return { setHeader, addLineFromEvent, addLine };
+  }
+
+  const overlay = createOverlay();
+
+  function parseEventFromLogNode(node) {
+    const msg = node.querySelector("span[class*='messagePart']") || node;
+    const raw = (msg.innerText || msg.textContent || "").trim();
+    if (!raw) return null;
+
+    const text = raw.replace(/\s+/g, " ");
+    const lower = text.toLowerCase();
+    const { actor, partner } = extractNamesFromMessage(msg);
+    const vp = getVpForPlayerName(actor || "");
+
+    if (lower.includes("wants to give") && lower.includes(" for ")) {
+      const { giveBag, getBag } = splitImagesGiveGet(
+        msg,
+        "wants to give",
+        "for",
+        null
+      );
+
+      const delta = emptyBag();
+      addBag(delta, giveBag, -1);
+      addBag(delta, getBag, +1);
+
+      return {
+        game_id: gameId,
+        turn_number: turnNumber,
+        subject: actor || "",
+        object: "",
+        action: "offer_trade",
+        resource: delta,
+        vp,
+      };
+    }
+
+    if (
+      lower.includes(" gave ") &&
+      lower.includes(" and got ") &&
+      lower.includes(" from ")
+    ) {
+      const { giveBag, getBag } = splitImagesGiveGet(
+        msg,
+        "gave",
+        "and got",
+        "from"
+      );
+
+      const delta = emptyBag();
+      addBag(delta, giveBag, -1);
+      addBag(delta, getBag, +1);
+
+      return {
+        game_id: gameId,
+        turn_number: turnNumber,
+        subject: actor || "",
+        object: partner || "",
+        action: "accept_trade",
+        resource: delta,
+        vp,
+      };
+    }
+
+    if (lower.includes("built a road")) {
+      const delta = emptyBag();
+      addBag(delta, BUILD_COST.road, -1);
+      return {
+        game_id: gameId,
+        turn_number: turnNumber,
+        subject: actor || "",
+        object: "",
+        action: "build_road",
+        resource: delta,
+        vp,
+      };
+    }
+    if (lower.includes("built a settlement")) {
+      const delta = emptyBag();
+      addBag(delta, BUILD_COST.settlement, -1);
+      return {
+        game_id: gameId,
+        turn_number: turnNumber,
+        subject: actor || "",
+        object: "",
+        action: "build_settlement",
+        resource: delta,
+        vp,
+      };
+    }
+    if (lower.includes("built a city")) {
+      const delta = emptyBag();
+      addBag(delta, BUILD_COST.city, -1);
+      return {
+        game_id: gameId,
+        turn_number: turnNumber,
+        subject: actor || "",
+        object: "",
+        action: "build_city",
+        resource: delta,
+        vp,
+      };
+    }
+
+    if (
+      lower.includes(" bought") &&
+      (lower.includes("development") ||
+        lower.includes("dev") ||
+        lower.includes("card"))
+    ) {
+      const delta = emptyBag();
+      addBag(delta, BUILD_COST.dev, -1);
+      return {
+        game_id: gameId,
+        turn_number: turnNumber,
+        subject: actor || "",
+        object: "",
+        action: "buy_dev_card",
+        resource: delta,
+        vp,
+      };
+    }
+
+    if (lower.includes("placed a road")) {
+      return {
+        game_id: gameId,
+        turn_number: turnNumber,
+        subject: actor || "",
+        object: "",
+        action: "place_road",
+        resource: "",
+        vp,
+      };
+    }
+    if (lower.includes("placed a settlement")) {
+      return {
+        game_id: gameId,
+        turn_number: turnNumber,
+        subject: actor || "",
+        object: "",
+        action: "place_settlement",
+        resource: "",
+        vp,
+      };
+    }
+    if (lower.includes("placed a city")) {
+      return {
+        game_id: gameId,
+        turn_number: turnNumber,
+        subject: actor || "",
+        object: "",
+        action: "place_city",
+        resource: "",
+        vp,
+      };
+    }
+
+    if (lower.includes("stole") && lower.includes(" from ")) {
+      return {
+        game_id: gameId,
+        turn_number: turnNumber,
+        subject: actor || "",
+        object: partner || "",
+        action: "rob",
+        resource: "",
+        vp,
+      };
+    }
+
+    const gain = bagFromAllImages(msg);
+    const anyGain = RES_KEYS.some((r) => gain[r] !== 0);
+    if (anyGain) {
+      return {
+        game_id: gameId,
+        turn_number: turnNumber,
+        subject: actor || "",
+        object: "",
+        action: "receive",
+        resource: gain,
+        vp,
+      };
+    }
+
+    return {
+      game_id: gameId,
+      turn_number: turnNumber,
+      subject: actor || "",
+      object: partner || "",
+      action: "other",
+      resource: { text },
+      vp,
+    };
+  }
+
+  let logRoot = null;
+  let logScroller = null;
+  let logObserver = null;
+  let lastLogIndex = -1;
+
+  function findLogRoot() {
+    return document.querySelector(LOG_ROOT_SELECTOR);
+  }
+
+  function findLogScroller() {
+    if (!logRoot) return null;
+    const vs = logRoot.querySelector("div[class*='virtualScroller']");
+    if (vs) return vs;
+    const divs = logRoot.querySelectorAll("div");
+    for (const d of divs) {
+      if (d.querySelector("div[data-index]")) return d;
+    }
+    return null;
+  }
+
+  function resetLogState() {
+    lastLogIndex = -1;
+    overlay?.setHeader?.();
+  }
+
+  function handleLogNode(node) {
+    if (isTurnDelimiter(node)) {
+      turnNumber += 1;
+      overlay?.setHeader?.();
+      return;
+    }
+    const evt = parseEventFromLogNode(node);
+    if (evt) {
+      sendRow(evt);
+      overlay?.setHeader?.();
+      overlay?.addLineFromEvent?.(evt);
+    }
+  }
+
+  function processSequentialLogs() {
+    const pathKey = `${location.origin}${location.pathname}`;
+    if (pathKey !== lastPathKey) {
+      lastPathKey = pathKey;
+      startNewGame("path_changed");
+      logRoot = null;
+      logScroller = null;
+      resetLogState();
+      return;
+    }
+
+    if (!logRoot || !document.contains(logRoot)) {
+      const maybe = findLogRoot();
+      if (!maybe) {
+        if (!lastLogMissingAt) lastLogMissingAt = Date.now();
+        return;
+      }
+
+      if (
+        lastLogMissingAt &&
+        Date.now() - lastLogMissingAt > LOG_MISSING_NEW_GAME_MS
+      ) {
+        startNewGame("log_reappeared_after_missing");
+      }
+
+      lastLogMissingAt = null;
+      logRoot = maybe;
+      logScroller = null;
+      resetLogState();
+    }
+
+    if (!logScroller || !document.contains(logScroller)) {
+      logScroller = findLogScroller();
+      if (!logScroller) return;
+    }
+
+    const items = [...logScroller.querySelectorAll("div[data-index]")];
+    if (!items.length) return;
+
+    let min = Infinity,
+      max = -Infinity;
+    for (const el of items) {
+      const v = +el.getAttribute("data-index");
+      if (!Number.isFinite(v)) continue;
+      if (v < min) min = v;
+      if (v > max) max = v;
+    }
+    if (!Number.isFinite(min)) return;
+
+    if (lastLogIndex === -1) lastLogIndex = min - 1;
+    if (lastLogIndex < min - 1) lastLogIndex = min - 1;
+
+    for (let idx = lastLogIndex + 1; idx <= max; idx++) {
+      const node = logScroller.querySelector(`div[data-index="${idx}"]`);
+      lastLogIndex = idx;
+      if (!node) continue;
+      handleLogNode(node);
+    }
+    overlay?.setHeader?.();
+  }
+
+  function setupLogObserver() {
+    const root = findLogRoot();
+    if (!root) return;
+
+    logRoot = root;
+    logScroller = findLogScroller();
+
+    if (logObserver) logObserver.disconnect();
+    logObserver = new MutationObserver((muts) => {
+      let maybeNew = false;
+      for (const m of muts) {
+        for (const n of m.addedNodes) {
+          if (!(n instanceof HTMLElement)) continue;
+          const it = n.matches("div[data-index]")
+            ? n
+            : n.querySelector?.("div[data-index]");
+          if (!it) continue;
+          const idx = +it.getAttribute("data-index");
+          if (Number.isFinite(idx) && idx > lastLogIndex) maybeNew = true;
+        }
+      }
+      if (maybeNew) processSequentialLogs();
+    });
+
+    logObserver.observe(logRoot, { childList: true, subtree: true });
+  }
+
+  function init() {
+    log("content.js init", { url: location.href, gameId, turnNumber });
+    overlay?.setHeader?.();
+    setupLogObserver();
+    processSequentialLogs();
+
+    setInterval(() => {
+      if (!logRoot || !document.contains(logRoot)) setupLogObserver();
+      processSequentialLogs();
+    }, TICK_MS);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+})();
