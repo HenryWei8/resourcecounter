@@ -1,3 +1,4 @@
+// content.js
 (() => {
   if (window.__colonistTurnLoggerLoaded) return;
   window.__colonistTurnLoggerLoaded = true;
@@ -49,6 +50,42 @@
     RES_KEYS.forEach((r) => (dst[r] += s * (src[r] || 0)));
   }
 
+  let selfName = null;
+  function detectSelfName() {
+    if (selfName) return selfName;
+    const cur = document.querySelector("[class*='currentUser']");
+    if (cur) {
+      const ne = cur.querySelector("[class*='username'],[class*='name']");
+      if (ne) {
+        selfName = ne.textContent.trim();
+        return selfName;
+      }
+    }
+    const info = document.querySelector(
+      "[class*='gamePlayerInformationContainer']"
+    );
+    if (info) {
+      const rows = info.querySelectorAll("[class*='playerRow']");
+      if (rows.length) {
+        const last = rows[rows.length - 1];
+        const ne = last.querySelector("[class*='username'],[class*='name']");
+        if (ne) {
+          selfName = ne.textContent.trim();
+          return selfName;
+        }
+      }
+    }
+    return selfName;
+  }
+
+  function normalizeActor(name) {
+    if (!name) return null;
+    if (name === "You" || name === "you") {
+      return detectSelfName() || name;
+    }
+    return name;
+  }
+
   function keyFromImg(img) {
     if (!img) return null;
     const alt = (img.alt || "").toLowerCase().trim();
@@ -56,6 +93,81 @@
     const src = (img.src || "").toLowerCase();
     for (const word of Object.keys(RES_WORD_TO_KEY)) {
       if (src.includes(word)) return RES_WORD_TO_KEY[word];
+    }
+    return null;
+  }
+
+  function dieFromImg(img) {
+    if (!img) return null;
+    const alt = (img.alt || "").toLowerCase().trim();
+    let m = alt.match(/^dice_(\d+)$/);
+    if (m) {
+      const v = parseInt(m[1], 10);
+      if (Number.isFinite(v)) return v;
+    }
+    const src = (img.src || "").toLowerCase();
+    m = src.match(/dice[_-](\d+)/);
+    if (m) {
+      const v = parseInt(m[1], 10);
+      if (Number.isFinite(v)) return v;
+    }
+    return null;
+  }
+
+  function readDiceFromNode(node) {
+    if (!node) return null;
+    const dice = [];
+    const imgs = [...node.querySelectorAll("img[alt], img[src]")];
+    for (const im of imgs) {
+      const v = dieFromImg(im);
+      if (v != null) dice.push(v);
+    }
+    return dice.length ? dice : null;
+  }
+
+  function devCardNameFromText(s) {
+    const t = (s || "").toLowerCase();
+    if (t.includes("knight")) return "Knight";
+    if (t.includes("monopoly")) return "Monopoly";
+    if (
+      t.includes("year of plenty") ||
+      (t.includes("year") && t.includes("plenty"))
+    )
+      return "Year of Plenty";
+    if (t.includes("road") && t.includes("build")) return "Road Building";
+    if (
+      t.includes("1 point") ||
+      t.includes("victory point") ||
+      t.includes("victory")
+    )
+      return "Victory Point";
+    return null;
+  }
+
+  function detectUsedDevCard(msgEl) {
+    if (!msgEl) return null;
+    const imgs = [...msgEl.querySelectorAll("img[alt], img[src]")];
+    for (const im of imgs) {
+      const n1 = devCardNameFromText(im.alt || "");
+      if (n1) return n1;
+      const n2 = devCardNameFromText(im.src || "");
+      if (n2) return n2;
+    }
+    return null;
+  }
+
+  function detectDevPurchaseLabel(msgEl) {
+    if (!msgEl) return null;
+    const imgs = [...msgEl.querySelectorAll("img[alt], img[src]")];
+    for (const im of imgs) {
+      const alt = (im.alt || "").trim();
+      const altL = alt.toLowerCase();
+      const srcL = (im.src || "").toLowerCase();
+      if (altL === "development card") return alt || "Development Card";
+      if (altL.includes("development") && altL.includes("card"))
+        return alt || "Development Card";
+      if (srcL.includes("development") && srcL.includes("card"))
+        return "Development Card";
     }
     return null;
   }
@@ -485,14 +597,11 @@
       };
     }
 
-    if (
-      lower.includes(" bought") &&
-      (lower.includes("development") ||
-        lower.includes("dev") ||
-        lower.includes("card"))
-    ) {
+    const boughtLabel = detectDevPurchaseLabel(msg);
+    if (/\bbought\b/i.test(text) && boughtLabel) {
       const delta = emptyBag();
       addBag(delta, BUILD_COST.dev, -1);
+      delta.bought = boughtLabel;
       return {
         game_id: gameId,
         turn_number: turnNumber,
@@ -538,14 +647,82 @@
       };
     }
 
+    // ROBBERY (ego delta logged)
     if (lower.includes("stole") && lower.includes(" from ")) {
+      const thiefTok = (text.match(/^(\S+)/) || [null, null])[1];
+      const victimTok = (text.match(/ from (\S+)/i) || [null, null])[1];
+      const thief = normalizeActor(thiefTok);
+      const victim = normalizeActor(
+        victimTok ? victimTok.replace(/[.!?]$/, "") : null
+      );
+
+      const me = detectSelfName();
+      const bag = bagFromAllImages(msg);
+      const keys = RES_KEYS.filter((r) => (bag[r] || 0) > 0);
+      const stolenRes = keys.length === 1 ? keys[0] : null;
+
+      if (me && thief === me) {
+        const delta = stolenRes ? { [stolenRes]: 1 } : { unknown: 1 };
+        return {
+          game_id: gameId,
+          turn_number: turnNumber,
+          subject: me,
+          object: victim || "",
+          action: "rob",
+          resource: delta,
+          vp: getVpForPlayerName(me) || vp,
+        };
+      }
+
+      if (me && victim === me) {
+        const delta = stolenRes ? { [stolenRes]: -1 } : { unknown: -1 };
+        return {
+          game_id: gameId,
+          turn_number: turnNumber,
+          subject: me,
+          object: thief || "",
+          action: "rob",
+          resource: delta,
+          vp: getVpForPlayerName(me) || vp,
+        };
+      }
+
+      return {
+        game_id: gameId,
+        turn_number: turnNumber,
+        subject: thief || actor || "",
+        object: victim || partner || "",
+        action: "rob",
+        resource: "",
+        vp,
+      };
+    }
+
+    const dice = readDiceFromNode(msg);
+    if (/\brolled\b/i.test(text) && dice && dice.length >= 2) {
+      const d1 = dice[0];
+      const d2 = dice[1];
+      const total = d1 + d2;
       return {
         game_id: gameId,
         turn_number: turnNumber,
         subject: actor || "",
-        object: partner || "",
-        action: "rob",
-        resource: "",
+        object: "",
+        action: "other",
+        resource: { text, dice: [d1, d2], roll_total: total },
+        vp,
+      };
+    }
+
+    const usedDev = detectUsedDevCard(node) || detectUsedDevCard(msg);
+    if (/\bused\b/i.test(text) && usedDev) {
+      return {
+        game_id: gameId,
+        turn_number: turnNumber,
+        subject: actor || "",
+        object: "",
+        action: "other",
+        resource: { text, dev_card: usedDev },
         vp,
       };
     }
@@ -704,6 +881,7 @@
 
   function init() {
     log("content.js init", { url: location.href, gameId, turnNumber });
+    detectSelfName();
     overlay?.setHeader?.();
     setupLogObserver();
     processSequentialLogs();

@@ -5,7 +5,7 @@ const DEBUG = true;
 const KEY_WEB_APP_URL = "CTL_WEB_APP_URL";
 
 const WEB_APP_URL_FALLBACK =
-  "https://script.google.com/macros/s/AKfycbwtAgJHwN7nY-xYeCc6qiK7LhiTtxZHeRvCXjpt6nQ4a6JE1FpjZpWnatvyrUVgyyV0QA/exec";
+  "https://script.google.com/macros/s/AKfycbzM4kNvu1j4Egeic1VI8untHeu1ZvBq48ZKsXbA7AegjDK-EA8X9dl75GS6VhbZvcl4Cg/exec";
 
 function log(...args) {
   if (DEBUG) console.log("[CTL]", ...args);
