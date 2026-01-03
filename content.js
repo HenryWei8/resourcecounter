@@ -1,4 +1,3 @@
-// content.js
 (() => {
   if (window.__colonistTurnLoggerLoaded) return;
   window.__colonistTurnLoggerLoaded = true;
@@ -275,12 +274,42 @@
   let gameId = allocGameId();
   let turnNumber = 1;
 
+  // --- NEW: per-turn ordering buffer (roll must be sent first) ---
+  let rollSentThisTurn = false;
+  let pendingTurnEvents = [];
+  function resetTurnOrderingState_() {
+    rollSentThisTurn = false;
+    pendingTurnEvents = [];
+  }
+  function isRollEvent_(evt) {
+    return (
+      evt &&
+      evt.action === "other" &&
+      evt.resource &&
+      typeof evt.resource === "object" &&
+      evt.resource.roll_total !== undefined &&
+      evt.resource.roll_total !== null
+    );
+  }
+  function flushPendingTurnEvents_() {
+    if (!pendingTurnEvents.length) return;
+    const toSend = pendingTurnEvents;
+    pendingTurnEvents = [];
+    for (const evt of toSend) {
+      sendRow(evt);
+      overlay?.setHeader?.();
+      overlay?.addLineFromEvent?.(evt);
+    }
+  }
+  // ---------------------------------------------------------------
+
   let lastPathKey = `${location.origin}${location.pathname}`;
   let lastLogMissingAt = null;
 
   function startNewGame(reason) {
     gameId = allocGameId();
     turnNumber = 1;
+    resetTurnOrderingState_();
     log("NEW GAME", { gameId, reason, url: location.href });
     overlay?.setHeader?.();
     overlay?.addLine?.(`NEW GAME (${reason})`, "sys");
@@ -647,7 +676,6 @@
       };
     }
 
-    // ROBBERY (ego delta logged)
     if (lower.includes("stole") && lower.includes(" from ")) {
       const thiefTok = (text.match(/^(\S+)/) || [null, null])[1];
       const victimTok = (text.match(/ from (\S+)/i) || [null, null])[1];
@@ -779,16 +807,43 @@
 
   function handleLogNode(node) {
     if (isTurnDelimiter(node)) {
+      // --- NEW: flush whatever we buffered for this turn before moving on ---
+      flushPendingTurnEvents_();
       turnNumber += 1;
+      resetTurnOrderingState_();
       overlay?.setHeader?.();
       return;
     }
+
     const evt = parseEventFromLogNode(node);
-    if (evt) {
-      sendRow(evt);
-      overlay?.setHeader?.();
-      overlay?.addLineFromEvent?.(evt);
+    if (!evt) return;
+
+    // --- NEW: enforce "roll first" ordering in Sheets ---
+    if (isRollEvent_(evt)) {
+      if (!rollSentThisTurn) {
+        // Send roll immediately, then flush buffered events for the same turn.
+        sendRow(evt);
+        overlay?.setHeader?.();
+        overlay?.addLineFromEvent?.(evt);
+        rollSentThisTurn = true;
+        flushPendingTurnEvents_();
+      } else {
+        // Ignore extra roll-like events in the same turn to avoid duplicates.
+      }
+      return;
     }
+
+    if (!rollSentThisTurn) {
+      // Buffer until we see the roll for this turn (or until delimiter).
+      pendingTurnEvents.push(evt);
+      overlay?.setHeader?.();
+      return;
+    }
+
+    // Normal behavior after roll is sent.
+    sendRow(evt);
+    overlay?.setHeader?.();
+    overlay?.addLineFromEvent?.(evt);
   }
 
   function processSequentialLogs() {
