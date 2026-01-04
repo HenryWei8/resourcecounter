@@ -79,9 +79,7 @@
 
   function normalizeActor(name) {
     if (!name) return null;
-    if (name === "You" || name === "you") {
-      return detectSelfName() || name;
-    }
+    if (name === "You" || name === "you") return detectSelfName() || name;
     return name;
   }
 
@@ -181,7 +179,7 @@
     return bag;
   }
 
-  function splitImagesGiveGet(node, giveText, midText, endText) {
+  function splitImagesGiveGetFallback_(node, giveText, midText, endText) {
     const give = emptyBag();
     const get = emptyBag();
     let mode = "before";
@@ -196,9 +194,10 @@
 
       if (n.nodeType === 3) {
         const t = (n.textContent || "").toLowerCase();
-        if (t.includes(giveText.toLowerCase())) mode = "give";
-        if (t.includes(midText.toLowerCase())) mode = "get";
-        if (endText && t.includes(endText.toLowerCase())) mode = "after";
+        if (t.includes(String(giveText).toLowerCase())) mode = "give";
+        if (t.includes(String(midText).toLowerCase())) mode = "get";
+        if (endText && t.includes(String(endText).toLowerCase()))
+          mode = "after";
       } else if (n.nodeType === 1 && n.tagName === "IMG") {
         const k = keyFromImg(n);
         if (!k) continue;
@@ -206,6 +205,59 @@
         else if (mode === "get") get[k] += 1;
       }
     }
+    return { giveBag: give, getBag: get };
+  }
+
+  function splitImagesGiveGetByTextPositions(node, giveText, midText, endText) {
+    const give = emptyBag();
+    const get = emptyBag();
+
+    const giveKey = String(giveText || "").toLowerCase();
+    const midKey = String(midText || "").toLowerCase();
+    const endKey = endText ? String(endText).toLowerCase() : null;
+
+    const w = document.createTreeWalker(
+      node,
+      NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT
+    );
+
+    let full = "";
+    let cursor = 0;
+    const imgs = [];
+
+    while (w.nextNode()) {
+      const n = w.currentNode;
+
+      if (n.nodeType === 3) {
+        const t = (n.textContent || "").replace(/\s+/g, " ");
+        full += t;
+        cursor += t.length;
+      } else if (n.nodeType === 1 && n.tagName === "IMG") {
+        const k = keyFromImg(n);
+        if (k) imgs.push({ pos: cursor, key: k });
+      }
+    }
+
+    const lower = full.toLowerCase();
+    const iGive = lower.indexOf(giveKey);
+    const iMid = lower.indexOf(midKey, Math.max(0, iGive));
+    const iEnd = endKey ? lower.indexOf(endKey, Math.max(0, iMid)) : -1;
+
+    if (iGive < 0 || iMid < 0) {
+      return splitImagesGiveGetFallback_(node, giveText, midText, endText);
+    }
+
+    const giveStart = iGive;
+    const giveEnd = iMid;
+    const getStart = iMid;
+    const getEnd = iEnd >= 0 ? iEnd : Infinity;
+
+    for (const im of imgs) {
+      const p = im.pos;
+      if (p >= giveStart && p < giveEnd) give[im.key] += 1;
+      else if (p >= getStart && p < getEnd) get[im.key] += 1;
+    }
+
     return { giveBag: give, getBag: get };
   }
 
@@ -230,12 +282,6 @@
       partner = pm ? pm[1].replace(/[.!?]$/, "") : null;
     }
     return { actor, partner };
-  }
-
-  function isTurnDelimiter(itemNode) {
-    const msg =
-      itemNode.querySelector("span[class*='messagePart']") || itemNode;
-    return !!msg.querySelector("hr");
   }
 
   function getVpForPlayerName(name) {
@@ -272,15 +318,8 @@
   }
 
   let gameId = allocGameId();
-  let turnNumber = 1;
+  let turnNumber = 0;
 
-  // --- NEW: per-turn ordering buffer (roll must be sent first) ---
-  let rollSentThisTurn = false;
-  let pendingTurnEvents = [];
-  function resetTurnOrderingState_() {
-    rollSentThisTurn = false;
-    pendingTurnEvents = [];
-  }
   function isRollEvent_(evt) {
     return (
       evt &&
@@ -291,39 +330,26 @@
       evt.resource.roll_total !== null
     );
   }
-  function flushPendingTurnEvents_() {
-    if (!pendingTurnEvents.length) return;
-    const toSend = pendingTurnEvents;
-    pendingTurnEvents = [];
-    for (const evt of toSend) {
-      sendRow(evt);
-      overlay?.setHeader?.();
-      overlay?.addLineFromEvent?.(evt);
-    }
-  }
-  // ---------------------------------------------------------------
-
-  let lastPathKey = `${location.origin}${location.pathname}`;
-  let lastLogMissingAt = null;
-
-  function startNewGame(reason) {
-    gameId = allocGameId();
-    turnNumber = 1;
-    resetTurnOrderingState_();
-    log("NEW GAME", { gameId, reason, url: location.href });
-    overlay?.setHeader?.();
-    overlay?.addLine?.(`NEW GAME (${reason})`, "sys");
-  }
 
   function sendRow(row) {
-    if (!chrome?.runtime?.sendMessage) {
-      warn("chrome.runtime.sendMessage not available; cannot POST", row);
+    const rt =
+      globalThis.chrome?.runtime?.sendMessage ||
+      globalThis.browser?.runtime?.sendMessage;
+    if (!rt) {
+      warn(
+        "chrome.runtime.sendMessage not available; cannot POST",
+        row,
+        "NOTE: This happens if your content script runs in MAIN world or you pasted code into DevTools."
+      );
       return;
     }
-    chrome.runtime.sendMessage(
+    rt.call(
+      globalThis.chrome?.runtime || globalThis.browser?.runtime,
       { type: "POST_TURN_EVENTS", record: row },
       (resp) => {
-        const err = chrome.runtime.lastError;
+        const err =
+          globalThis.chrome?.runtime?.lastError ||
+          globalThis.browser?.runtime?.lastError;
         if (err) warn("sendMessage error:", err.message || err);
         else if (DEBUG) log("POST_TURN_EVENTS resp:", resp);
       }
@@ -536,27 +562,17 @@
     const { actor, partner } = extractNamesFromMessage(msg);
     const vp = getVpForPlayerName(actor || "");
 
+    if (
+      lower.includes("happy settling") ||
+      lower.includes("learn how to play") ||
+      lower.includes("rulebook") ||
+      lower.includes("list of commands")
+    ) {
+      return null;
+    }
+
     if (lower.includes("wants to give") && lower.includes(" for ")) {
-      const { giveBag, getBag } = splitImagesGiveGet(
-        msg,
-        "wants to give",
-        "for",
-        null
-      );
-
-      const delta = emptyBag();
-      addBag(delta, giveBag, -1);
-      addBag(delta, getBag, +1);
-
-      return {
-        game_id: gameId,
-        turn_number: turnNumber,
-        subject: actor || "",
-        object: "",
-        action: "offer_trade",
-        resource: delta,
-        vp,
-      };
+      return null;
     }
 
     if (
@@ -564,7 +580,7 @@
       lower.includes(" and got ") &&
       lower.includes(" from ")
     ) {
-      const { giveBag, getBag } = splitImagesGiveGet(
+      const { giveBag, getBag } = splitImagesGiveGetByTextPositions(
         msg,
         "gave",
         "and got",
@@ -599,6 +615,7 @@
         vp,
       };
     }
+
     if (lower.includes("built a settlement")) {
       const delta = emptyBag();
       addBag(delta, BUILD_COST.settlement, -1);
@@ -612,6 +629,7 @@
         vp,
       };
     }
+
     if (lower.includes("built a city")) {
       const delta = emptyBag();
       addBag(delta, BUILD_COST.city, -1);
@@ -758,6 +776,13 @@
     const gain = bagFromAllImages(msg);
     const anyGain = RES_KEYS.some((r) => gain[r] !== 0);
     if (anyGain) {
+      if (lower.includes("trade")) return null;
+      if (
+        lower.includes(" gave ") &&
+        (lower.includes(" got ") || lower.includes(" and got "))
+      )
+        return null;
+
       return {
         game_id: gameId,
         turn_number: turnNumber,
@@ -780,10 +805,70 @@
     };
   }
 
+  function emit_(evt) {
+    sendRow(evt);
+    overlay?.setHeader?.();
+    overlay?.addLineFromEvent?.(evt);
+  }
+
+  function isTurnDelimiter(itemNode) {
+    const msg =
+      itemNode.querySelector("span[class*='messagePart']") || itemNode;
+    return !!msg.querySelector("hr");
+  }
+
+  let turnBuffer = [];
+
+  function flushTurnBuffer_() {
+    if (!turnBuffer.length) return;
+
+    let rollIdx = -1;
+    let rollCount = 0;
+    for (let i = 0; i < turnBuffer.length; i++) {
+      if (isRollEvent_(turnBuffer[i])) {
+        rollCount += 1;
+        if (rollIdx === -1) rollIdx = i;
+      }
+    }
+
+    if (rollCount === 1 && rollIdx >= 0) {
+      turnNumber += 1;
+      for (const e of turnBuffer) e.turn_number = turnNumber;
+
+      // roll first, everything else in original order
+      emit_(turnBuffer[rollIdx]);
+      for (let i = 0; i < turnBuffer.length; i++) {
+        if (i === rollIdx) continue;
+        emit_(turnBuffer[i]);
+      }
+    } else {
+      for (const e of turnBuffer) {
+        e.turn_number = turnNumber;
+        emit_(e);
+      }
+    }
+
+    turnBuffer = [];
+  }
+
   let logRoot = null;
   let logScroller = null;
   let logObserver = null;
   let lastLogIndex = -1;
+
+  let lastPathKey = `${location.origin}${location.pathname}`;
+  let lastLogMissingAt = null;
+
+  function startNewGame(reason) {
+    flushTurnBuffer_();
+
+    gameId = allocGameId();
+    turnNumber = 0;
+    turnBuffer = [];
+    log("NEW GAME", { gameId, reason, url: location.href });
+    overlay?.setHeader?.();
+    overlay?.addLine?.(`NEW GAME (${reason})`, "sys");
+  }
 
   function findLogRoot() {
     return document.querySelector(LOG_ROOT_SELECTOR);
@@ -807,10 +892,7 @@
 
   function handleLogNode(node) {
     if (isTurnDelimiter(node)) {
-      // --- NEW: flush whatever we buffered for this turn before moving on ---
-      flushPendingTurnEvents_();
-      turnNumber += 1;
-      resetTurnOrderingState_();
+      flushTurnBuffer_();
       overlay?.setHeader?.();
       return;
     }
@@ -818,32 +900,9 @@
     const evt = parseEventFromLogNode(node);
     if (!evt) return;
 
-    // --- NEW: enforce "roll first" ordering in Sheets ---
-    if (isRollEvent_(evt)) {
-      if (!rollSentThisTurn) {
-        // Send roll immediately, then flush buffered events for the same turn.
-        sendRow(evt);
-        overlay?.setHeader?.();
-        overlay?.addLineFromEvent?.(evt);
-        rollSentThisTurn = true;
-        flushPendingTurnEvents_();
-      } else {
-        // Ignore extra roll-like events in the same turn to avoid duplicates.
-      }
-      return;
-    }
-
-    if (!rollSentThisTurn) {
-      // Buffer until we see the roll for this turn (or until delimiter).
-      pendingTurnEvents.push(evt);
-      overlay?.setHeader?.();
-      return;
-    }
-
-    // Normal behavior after roll is sent.
-    sendRow(evt);
+    // buffer strictly in DOM order
+    turnBuffer.push(evt);
     overlay?.setHeader?.();
-    overlay?.addLineFromEvent?.(evt);
   }
 
   function processSequentialLogs() {
@@ -904,6 +963,7 @@
       if (!node) continue;
       handleLogNode(node);
     }
+
     overlay?.setHeader?.();
   }
 
