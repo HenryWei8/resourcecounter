@@ -5,7 +5,7 @@
   const DEBUG = true;
   const LOG_ROOT_SELECTOR = "[class*='gameFeedsContainer']";
   const TICK_MS = 900;
-  const LOG_MISSING_NEW_GAME_MS = 3500;
+  const TURN_IDLE_FLUSH_MS = 25000;
 
   const OVERLAY_ENABLED = true;
   const OVERLAY_MAX_ROWS = 40;
@@ -47,6 +47,9 @@
   }
   function addBag(dst, src, s = 1) {
     RES_KEYS.forEach((r) => (dst[r] += s * (src[r] || 0)));
+  }
+  function bagHasAny(b) {
+    return RES_KEYS.some((r) => (b[r] || 0) !== 0);
   }
 
   let selfName = null;
@@ -183,15 +186,12 @@
     const give = emptyBag();
     const get = emptyBag();
     let mode = "before";
-
     const w = document.createTreeWalker(
       node,
       NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT
     );
-
     while (w.nextNode()) {
       const n = w.currentNode;
-
       if (n.nodeType === 3) {
         const t = (n.textContent || "").toLowerCase();
         if (t.includes(String(giveText).toLowerCase())) mode = "give";
@@ -211,23 +211,18 @@
   function splitImagesGiveGetByTextPositions(node, giveText, midText, endText) {
     const give = emptyBag();
     const get = emptyBag();
-
     const giveKey = String(giveText || "").toLowerCase();
     const midKey = String(midText || "").toLowerCase();
     const endKey = endText ? String(endText).toLowerCase() : null;
-
     const w = document.createTreeWalker(
       node,
       NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT
     );
-
     let full = "";
     let cursor = 0;
     const imgs = [];
-
     while (w.nextNode()) {
       const n = w.currentNode;
-
       if (n.nodeType === 3) {
         const t = (n.textContent || "").replace(/\s+/g, " ");
         full += t;
@@ -237,27 +232,21 @@
         if (k) imgs.push({ pos: cursor, key: k });
       }
     }
-
     const lower = full.toLowerCase();
     const iGive = lower.indexOf(giveKey);
     const iMid = lower.indexOf(midKey, Math.max(0, iGive));
     const iEnd = endKey ? lower.indexOf(endKey, Math.max(0, iMid)) : -1;
-
-    if (iGive < 0 || iMid < 0) {
+    if (iGive < 0 || iMid < 0)
       return splitImagesGiveGetFallback_(node, giveText, midText, endText);
-    }
-
     const giveStart = iGive;
     const giveEnd = iMid;
     const getStart = iMid;
     const getEnd = iEnd >= 0 ? iEnd : Infinity;
-
     for (const im of imgs) {
       const p = im.pos;
       if (p >= giveStart && p < giveEnd) give[im.key] += 1;
       else if (p >= getStart && p < getEnd) get[im.key] += 1;
     }
-
     return { giveBag: give, getBag: get };
   }
 
@@ -268,10 +257,8 @@
     const names = nameSpans
       .map((s) => (s.textContent || "").trim())
       .filter(Boolean);
-
     let actor = names[0] || null;
     let partner = names.length >= 2 ? names[names.length - 1] : null;
-
     if (!actor) {
       const raw = (msgEl.innerText || msgEl.textContent || "")
         .trim()
@@ -292,13 +279,10 @@
         row.querySelector('div[class*="username"]') ||
         row.querySelector('div[class*="usernameLarge"]');
       if (!nameEl) continue;
-
       const rowName = (nameEl.textContent || "").trim();
       if (rowName !== name) continue;
-
       const vpEl = row.querySelector('span[class*="victoryPoints"]');
       if (!vpEl) return "";
-
       const vp = parseInt((vpEl.textContent || "").trim(), 10);
       return Number.isFinite(vp) ? vp : "";
     }
@@ -321,39 +305,40 @@
   let turnNumber = 0;
 
   function isRollEvent_(evt) {
-    return (
-      evt &&
-      evt.action === "other" &&
-      evt.resource &&
-      typeof evt.resource === "object" &&
+    if (!evt || !evt.resource || typeof evt.resource !== "object") return false;
+    if (
       evt.resource.roll_total !== undefined &&
       evt.resource.roll_total !== null
-    );
+    )
+      return true;
+    if (Array.isArray(evt.resource.dice) && evt.resource.dice.length >= 2)
+      return true;
+    return false;
   }
 
-  function sendRow(row) {
-    const rt =
-      globalThis.chrome?.runtime?.sendMessage ||
-      globalThis.browser?.runtime?.sendMessage;
-    if (!rt) {
-      warn(
-        "chrome.runtime.sendMessage not available; cannot POST",
-        row,
-        "NOTE: This happens if your content script runs in MAIN world or you pasted code into DevTools."
-      );
-      return;
-    }
-    rt.call(
-      globalThis.chrome?.runtime || globalThis.browser?.runtime,
-      { type: "POST_TURN_EVENTS", record: row },
-      (resp) => {
-        const err =
-          globalThis.chrome?.runtime?.lastError ||
-          globalThis.browser?.runtime?.lastError;
-        if (err) warn("sendMessage error:", err.message || err);
-        else if (DEBUG) log("POST_TURN_EVENTS resp:", resp);
+  let sendQueue = Promise.resolve();
+  function sendRowAsync(row) {
+    return new Promise((resolve) => {
+      const rt =
+        globalThis.chrome?.runtime?.sendMessage ||
+        globalThis.browser?.runtime?.sendMessage;
+      if (!rt) {
+        warn("chrome.runtime.sendMessage not available; cannot POST", row);
+        resolve(null);
+        return;
       }
-    );
+      rt.call(
+        globalThis.chrome?.runtime || globalThis.browser?.runtime,
+        { type: "POST_TURN_EVENTS", record: row },
+        (resp) => {
+          const err =
+            globalThis.chrome?.runtime?.lastError ||
+            globalThis.browser?.runtime?.lastError;
+          if (err) warn("sendMessage error:", err.message || err);
+          resolve(resp);
+        }
+      );
+    });
   }
 
   function formatResourceForOverlay(resource) {
@@ -378,6 +363,8 @@
       return String(resource);
     }
   }
+
+  let lastLogIndex = -1;
 
   function createOverlay() {
     if (!OVERLAY_ENABLED) return null;
@@ -526,31 +513,67 @@
       if (rs) row.appendChild(res);
 
       list.prepend(row);
-      while (list.childElementCount > OVERLAY_MAX_ROWS) {
+      while (list.childElementCount > OVERLAY_MAX_ROWS)
         list.removeChild(list.lastElementChild);
-      }
     }
 
-    function addLine(text, kind = "info") {
+    function addLine(text) {
       const row = document.createElement("div");
       row.style.padding = "8px 8px";
       row.style.borderRadius = "8px";
       row.style.border = "1px solid rgba(255,255,255,0.10)";
-      row.style.background =
-        kind === "sys" ? "rgba(120, 180, 255, 0.10)" : "rgba(255,255,255,0.04)";
+      row.style.background = "rgba(255,255,255,0.04)";
       row.style.fontSize = "12px";
       row.style.opacity = "0.92";
       row.textContent = text;
       list.prepend(row);
-      while (list.childElementCount > OVERLAY_MAX_ROWS) {
+      while (list.childElementCount > OVERLAY_MAX_ROWS)
         list.removeChild(list.lastElementChild);
-      }
     }
 
     return { setHeader, addLineFromEvent, addLine };
   }
 
   const overlay = createOverlay();
+
+  function emitBatch_(events) {
+    for (const e of events) {
+      overlay?.addLineFromEvent?.(e);
+      sendQueue = sendQueue.then(() => sendRowAsync(e));
+    }
+    overlay?.setHeader?.();
+  }
+
+  function normalizeTurnEvents_(events) {
+    let rollIdx = -1;
+    for (let i = 0; i < events.length; i++) {
+      if (isRollEvent_(events[i])) {
+        rollIdx = i;
+        break;
+      }
+    }
+    let ordered = events;
+    if (rollIdx > 0)
+      ordered = [
+        events[rollIdx],
+        ...events.slice(0, rollIdx),
+        ...events.slice(rollIdx + 1),
+      ];
+
+    const out = [];
+    for (const e of ordered) {
+      if (
+        e &&
+        e.action === "accept_trade" &&
+        out.length &&
+        out[out.length - 1].action === "receive"
+      ) {
+        out.pop();
+      }
+      out.push(e);
+    }
+    return out;
+  }
 
   function parseEventFromLogNode(node) {
     const msg = node.querySelector("span[class*='messagePart']") || node;
@@ -559,7 +582,11 @@
 
     const text = raw.replace(/\s+/g, " ");
     const lower = text.toLowerCase();
-    const { actor, partner } = extractNamesFromMessage(msg);
+
+    let { actor, partner } = extractNamesFromMessage(msg);
+    actor = normalizeActor(actor);
+    partner = normalizeActor(partner);
+
     const vp = getVpForPlayerName(actor || "");
 
     if (
@@ -567,12 +594,25 @@
       lower.includes("learn how to play") ||
       lower.includes("rulebook") ||
       lower.includes("list of commands")
-    ) {
+    )
       return null;
-    }
+    if (lower.includes("wants to give") && lower.includes(" for ")) return null;
 
-    if (lower.includes("wants to give") && lower.includes(" for ")) {
-      return null;
+    if (lower.includes("discard")) {
+      const bag = bagFromAllImages(msg);
+      if (bagHasAny(bag)) {
+        const delta = emptyBag();
+        addBag(delta, bag, -1);
+        return {
+          game_id: gameId,
+          turn_number: 0,
+          subject: actor || "",
+          object: "",
+          action: "discard",
+          resource: delta,
+          vp,
+        };
+      }
     }
 
     if (
@@ -586,14 +626,12 @@
         "and got",
         "from"
       );
-
       const delta = emptyBag();
       addBag(delta, giveBag, -1);
       addBag(delta, getBag, +1);
-
       return {
         game_id: gameId,
-        turn_number: turnNumber,
+        turn_number: 0,
         subject: actor || "",
         object: partner || "",
         action: "accept_trade",
@@ -607,7 +645,7 @@
       addBag(delta, BUILD_COST.road, -1);
       return {
         game_id: gameId,
-        turn_number: turnNumber,
+        turn_number: 0,
         subject: actor || "",
         object: "",
         action: "build_road",
@@ -621,7 +659,7 @@
       addBag(delta, BUILD_COST.settlement, -1);
       return {
         game_id: gameId,
-        turn_number: turnNumber,
+        turn_number: 0,
         subject: actor || "",
         object: "",
         action: "build_settlement",
@@ -635,7 +673,7 @@
       addBag(delta, BUILD_COST.city, -1);
       return {
         game_id: gameId,
-        turn_number: turnNumber,
+        turn_number: 0,
         subject: actor || "",
         object: "",
         action: "build_city",
@@ -651,7 +689,7 @@
       delta.bought = boughtLabel;
       return {
         game_id: gameId,
-        turn_number: turnNumber,
+        turn_number: 0,
         subject: actor || "",
         object: "",
         action: "buy_dev_card",
@@ -660,41 +698,38 @@
       };
     }
 
-    if (lower.includes("placed a road")) {
+    if (lower.includes("placed a road"))
       return {
         game_id: gameId,
-        turn_number: turnNumber,
+        turn_number: 0,
         subject: actor || "",
         object: "",
         action: "place_road",
         resource: "",
         vp,
       };
-    }
-    if (lower.includes("placed a settlement")) {
+    if (lower.includes("placed a settlement"))
       return {
         game_id: gameId,
-        turn_number: turnNumber,
+        turn_number: 0,
         subject: actor || "",
         object: "",
         action: "place_settlement",
         resource: "",
         vp,
       };
-    }
-    if (lower.includes("placed a city")) {
+    if (lower.includes("placed a city"))
       return {
         game_id: gameId,
-        turn_number: turnNumber,
+        turn_number: 0,
         subject: actor || "",
         object: "",
         action: "place_city",
         resource: "",
         vp,
       };
-    }
 
-    if (lower.includes("stole") && lower.includes(" from ")) {
+    if (lower.includes("stole") && lower.includes("from")) {
       const thiefTok = (text.match(/^(\S+)/) || [null, null])[1];
       const victimTok = (text.match(/ from (\S+)/i) || [null, null])[1];
       const thief = normalizeActor(thiefTok);
@@ -711,7 +746,7 @@
         const delta = stolenRes ? { [stolenRes]: 1 } : { unknown: 1 };
         return {
           game_id: gameId,
-          turn_number: turnNumber,
+          turn_number: 0,
           subject: me,
           object: victim || "",
           action: "rob",
@@ -724,7 +759,7 @@
         const delta = stolenRes ? { [stolenRes]: -1 } : { unknown: -1 };
         return {
           game_id: gameId,
-          turn_number: turnNumber,
+          turn_number: 0,
           subject: me,
           object: thief || "",
           action: "rob",
@@ -735,7 +770,7 @@
 
       return {
         game_id: gameId,
-        turn_number: turnNumber,
+        turn_number: 0,
         subject: thief || actor || "",
         object: victim || partner || "",
         action: "rob",
@@ -745,13 +780,13 @@
     }
 
     const dice = readDiceFromNode(msg);
-    if (/\brolled\b/i.test(text) && dice && dice.length >= 2) {
+    if ((/\brolled\b/i.test(text) || dice) && dice && dice.length >= 2) {
       const d1 = dice[0];
       const d2 = dice[1];
       const total = d1 + d2;
       return {
         game_id: gameId,
-        turn_number: turnNumber,
+        turn_number: 0,
         subject: actor || "",
         object: "",
         action: "other",
@@ -764,7 +799,7 @@
     if (/\bused\b/i.test(text) && usedDev) {
       return {
         game_id: gameId,
-        turn_number: turnNumber,
+        turn_number: 0,
         subject: actor || "",
         object: "",
         action: "other",
@@ -774,18 +809,15 @@
     }
 
     const gain = bagFromAllImages(msg);
-    const anyGain = RES_KEYS.some((r) => gain[r] !== 0);
-    if (anyGain) {
-      if (lower.includes("trade")) return null;
+    if (bagHasAny(gain)) {
       if (
         lower.includes(" gave ") &&
         (lower.includes(" got ") || lower.includes(" and got "))
       )
         return null;
-
       return {
         game_id: gameId,
-        turn_number: turnNumber,
+        turn_number: 0,
         subject: actor || "",
         object: "",
         action: "receive",
@@ -796,7 +828,7 @@
 
     return {
       game_id: gameId,
-      turn_number: turnNumber,
+      turn_number: 0,
       subject: actor || "",
       object: partner || "",
       action: "other",
@@ -805,69 +837,40 @@
     };
   }
 
-  function emit_(evt) {
-    sendRow(evt);
-    overlay?.setHeader?.();
-    overlay?.addLineFromEvent?.(evt);
-  }
-
-  function isTurnDelimiter(itemNode) {
-    const msg =
-      itemNode.querySelector("span[class*='messagePart']") || itemNode;
+  function isTurnDelimiter(node) {
+    const msg = node.querySelector("span[class*='messagePart']") || node;
     return !!msg.querySelector("hr");
   }
 
   let turnBuffer = [];
+  let lastBufferActivityAt = 0;
 
   function flushTurnBuffer_() {
     if (!turnBuffer.length) return;
-
-    let rollIdx = -1;
-    let rollCount = 0;
-    for (let i = 0; i < turnBuffer.length; i++) {
-      if (isRollEvent_(turnBuffer[i])) {
-        rollCount += 1;
-        if (rollIdx === -1) rollIdx = i;
-      }
-    }
-
-    if (rollCount === 1 && rollIdx >= 0) {
-      turnNumber += 1;
-      for (const e of turnBuffer) e.turn_number = turnNumber;
-
-      // roll first, everything else in original order
-      emit_(turnBuffer[rollIdx]);
-      for (let i = 0; i < turnBuffer.length; i++) {
-        if (i === rollIdx) continue;
-        emit_(turnBuffer[i]);
-      }
-    } else {
-      for (const e of turnBuffer) {
-        e.turn_number = turnNumber;
-        emit_(e);
-      }
-    }
-
+    turnNumber += 1;
+    for (const e of turnBuffer) e.turn_number = turnNumber;
+    emitBatch_(normalizeTurnEvents_(turnBuffer));
     turnBuffer = [];
+    lastBufferActivityAt = 0;
+    overlay?.setHeader?.();
   }
 
   let logRoot = null;
   let logScroller = null;
   let logObserver = null;
-  let lastLogIndex = -1;
 
-  let lastPathKey = `${location.origin}${location.pathname}`;
-  let lastLogMissingAt = null;
+  let lastKey = `${location.origin}${location.pathname}${location.hash}`;
 
   function startNewGame(reason) {
     flushTurnBuffer_();
-
     gameId = allocGameId();
     turnNumber = 0;
     turnBuffer = [];
+    lastBufferActivityAt = 0;
+    lastLogIndex = -1;
     log("NEW GAME", { gameId, reason, url: location.href });
+    overlay?.addLine?.(`NEW GAME (${reason})`);
     overlay?.setHeader?.();
-    overlay?.addLine?.(`NEW GAME (${reason})`, "sys");
   }
 
   function findLogRoot() {
@@ -885,55 +888,38 @@
     return null;
   }
 
-  function resetLogState() {
-    lastLogIndex = -1;
-    overlay?.setHeader?.();
-  }
-
   function handleLogNode(node) {
     if (isTurnDelimiter(node)) {
       flushTurnBuffer_();
-      overlay?.setHeader?.();
       return;
     }
 
     const evt = parseEventFromLogNode(node);
     if (!evt) return;
 
-    // buffer strictly in DOM order
+    if (isRollEvent_(evt) && turnBuffer.some((e) => isRollEvent_(e))) {
+      flushTurnBuffer_();
+    }
+
     turnBuffer.push(evt);
-    overlay?.setHeader?.();
+    lastBufferActivityAt = Date.now();
   }
 
-  function processSequentialLogs() {
-    const pathKey = `${location.origin}${location.pathname}`;
-    if (pathKey !== lastPathKey) {
-      lastPathKey = pathKey;
-      startNewGame("path_changed");
+  function processLogs() {
+    const key = `${location.origin}${location.pathname}${location.hash}`;
+    if (key !== lastKey) {
+      lastKey = key;
+      startNewGame("url_changed");
       logRoot = null;
       logScroller = null;
-      resetLogState();
       return;
     }
 
     if (!logRoot || !document.contains(logRoot)) {
       const maybe = findLogRoot();
-      if (!maybe) {
-        if (!lastLogMissingAt) lastLogMissingAt = Date.now();
-        return;
-      }
-
-      if (
-        lastLogMissingAt &&
-        Date.now() - lastLogMissingAt > LOG_MISSING_NEW_GAME_MS
-      ) {
-        startNewGame("log_reappeared_after_missing");
-      }
-
-      lastLogMissingAt = null;
+      if (!maybe) return;
       logRoot = maybe;
       logScroller = null;
-      resetLogState();
     }
 
     if (!logScroller || !document.contains(logScroller)) {
@@ -944,24 +930,34 @@
     const items = [...logScroller.querySelectorAll("div[data-index]")];
     if (!items.length) return;
 
-    let min = Infinity,
-      max = -Infinity;
+    const pairs = [];
     for (const el of items) {
-      const v = +el.getAttribute("data-index");
-      if (!Number.isFinite(v)) continue;
-      if (v < min) min = v;
-      if (v > max) max = v;
+      const idx = +el.getAttribute("data-index");
+      if (Number.isFinite(idx)) pairs.push([idx, el]);
     }
-    if (!Number.isFinite(min)) return;
+    if (!pairs.length) return;
 
-    if (lastLogIndex === -1) lastLogIndex = min - 1;
-    if (lastLogIndex < min - 1) lastLogIndex = min - 1;
+    pairs.sort((a, b) => a[0] - b[0]);
+    const minIdx = pairs[0][0];
+    const maxIdx = pairs[pairs.length - 1][0];
 
-    for (let idx = lastLogIndex + 1; idx <= max; idx++) {
-      const node = logScroller.querySelector(`div[data-index="${idx}"]`);
+    if (lastLogIndex !== -1 && maxIdx < lastLogIndex - 50) {
+      startNewGame("feed_reset");
+      return;
+    }
+
+    for (const [idx, node] of pairs) {
+      if (idx <= lastLogIndex) continue;
       lastLogIndex = idx;
-      if (!node) continue;
       handleLogNode(node);
+    }
+
+    if (
+      turnBuffer.length &&
+      lastBufferActivityAt &&
+      Date.now() - lastBufferActivityAt > TURN_IDLE_FLUSH_MS
+    ) {
+      flushTurnBuffer_();
     }
 
     overlay?.setHeader?.();
@@ -975,22 +971,7 @@
     logScroller = findLogScroller();
 
     if (logObserver) logObserver.disconnect();
-    logObserver = new MutationObserver((muts) => {
-      let maybeNew = false;
-      for (const m of muts) {
-        for (const n of m.addedNodes) {
-          if (!(n instanceof HTMLElement)) continue;
-          const it = n.matches("div[data-index]")
-            ? n
-            : n.querySelector?.("div[data-index]");
-          if (!it) continue;
-          const idx = +it.getAttribute("data-index");
-          if (Number.isFinite(idx) && idx > lastLogIndex) maybeNew = true;
-        }
-      }
-      if (maybeNew) processSequentialLogs();
-    });
-
+    logObserver = new MutationObserver(() => processLogs());
     logObserver.observe(logRoot, { childList: true, subtree: true });
   }
 
@@ -999,17 +980,15 @@
     detectSelfName();
     overlay?.setHeader?.();
     setupLogObserver();
-    processSequentialLogs();
+    processLogs();
 
     setInterval(() => {
       if (!logRoot || !document.contains(logRoot)) setupLogObserver();
-      processSequentialLogs();
+      processLogs();
     }, TICK_MS);
   }
 
-  if (document.readyState === "loading") {
+  if (document.readyState === "loading")
     document.addEventListener("DOMContentLoaded", init);
-  } else {
-    init();
-  }
+  else init();
 })();
