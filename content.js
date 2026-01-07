@@ -596,7 +596,8 @@
       lower.includes("list of commands")
     )
       return null;
-    if (lower.includes("wants to give") && lower.includes(" for ")) return null;
+
+    if (lower.includes("wants to")) return null;
 
     if (lower.includes("discard")) {
       const bag = bagFromAllImages(msg);
@@ -613,6 +614,27 @@
           vp,
         };
       }
+    }
+
+    if (lower.includes("gave bank") && lower.includes("and took")) {
+      const { giveBag, getBag } = splitImagesGiveGetByTextPositions(
+        msg,
+        "gave bank",
+        "and took",
+        null
+      );
+      const delta = emptyBag();
+      addBag(delta, giveBag, -1);
+      addBag(delta, getBag, +1);
+      return {
+        game_id: gameId,
+        turn_number: 0,
+        subject: actor || "",
+        object: "Bank",
+        action: "bank_trade",
+        resource: delta,
+        vp,
+      };
     }
 
     if (
@@ -938,7 +960,6 @@
     if (!pairs.length) return;
 
     pairs.sort((a, b) => a[0] - b[0]);
-    const minIdx = pairs[0][0];
     const maxIdx = pairs[pairs.length - 1][0];
 
     if (lastLogIndex !== -1 && maxIdx < lastLogIndex - 50) {
