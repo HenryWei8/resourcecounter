@@ -567,9 +567,8 @@
         e.action === "accept_trade" &&
         out.length &&
         out[out.length - 1].action === "receive"
-      ) {
+      )
         out.pop();
-      }
       out.push(e);
     }
     return out;
@@ -598,6 +597,8 @@
       return null;
 
     if (lower.includes("wants to")) return null;
+
+    if (lower.includes("blocked by")) return null;
 
     if (lower.includes("discard")) {
       const bag = bagFromAllImages(msg);
